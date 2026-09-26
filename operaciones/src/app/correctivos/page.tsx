@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import TopNav from "@/components/TopNav";
 import EstadoBadge from "@/components/EstadoBadge";
@@ -78,10 +78,30 @@ export default function CorrectivosPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function aplicarFiltros(e: React.FormEvent) {
-    e.preventDefault();
-    cargar(1, filtros);
+  // Los filtros de selección (estado, área, tipo, lugar, fechas) se
+  // aplican de inmediato al cambiar, sin necesidad de un botón "Filtrar".
+  function aplicarCambio(cambios: Partial<Filtros>) {
+    const nuevos = { ...filtros, ...cambios };
+    setFiltros(nuevos);
+    cargar(1, nuevos);
   }
+
+  // El campo de búsqueda de texto se actualiza en pantalla al instante,
+  // pero la consulta se dispara con un pequeño retraso después de que
+  // la persona deja de escribir, para no mandar una petición por cada
+  // letra.
+  const primerRender = useRef(true);
+  useEffect(() => {
+    if (primerRender.current) {
+      primerRender.current = false;
+      return;
+    }
+    const t = setTimeout(() => {
+      cargar(1, filtros);
+    }, 350);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtros.q]);
 
   function limpiarFiltros() {
     setFiltros(FILTROS_VACIOS);
@@ -132,8 +152,7 @@ export default function CorrectivosPage() {
           </div>
         </div>
 
-        <form
-          onSubmit={aplicarFiltros}
+        <div
           className="bg-white border-2 border-ink p-4 mb-6 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-9 gap-3 items-end"
         >
           <div className="col-span-2">
@@ -150,7 +169,7 @@ export default function CorrectivosPage() {
             <select
               className={input}
               value={filtros.estado}
-              onChange={(e) => setFiltros({ ...filtros, estado: e.target.value })}
+              onChange={(e) => aplicarCambio({ estado: e.target.value })}
             >
               <option value="">Todos</option>
               {ESTADOS.map((v) => (
@@ -163,7 +182,7 @@ export default function CorrectivosPage() {
             <select
               className={input}
               value={filtros.area}
-              onChange={(e) => setFiltros({ ...filtros, area: e.target.value })}
+              onChange={(e) => aplicarCambio({ area: e.target.value })}
             >
               <option value="">Todas</option>
               {AREAS.map((v) => (
@@ -176,7 +195,7 @@ export default function CorrectivosPage() {
             <select
               className={input}
               value={filtros.tipo_trab}
-              onChange={(e) => setFiltros({ ...filtros, tipo_trab: e.target.value })}
+              onChange={(e) => aplicarCambio({ tipo_trab: e.target.value })}
             >
               <option value="">Todos</option>
 
@@ -190,7 +209,7 @@ export default function CorrectivosPage() {
             <select
               className={input}
               value={filtros.lugar}
-              onChange={(e) => setFiltros({ ...filtros, lugar: e.target.value })}
+              onChange={(e) => aplicarCambio({ lugar: e.target.value })}
             >
               <option value="">Todos</option>
               {LUGARES.map((v) => (
@@ -204,7 +223,7 @@ export default function CorrectivosPage() {
               type="date"
               className={input}
               value={filtros.desde}
-              onChange={(e) => setFiltros({ ...filtros, desde: e.target.value })}
+              onChange={(e) => aplicarCambio({ desde: e.target.value })}
             />
           </div>
           <div>
@@ -213,25 +232,19 @@ export default function CorrectivosPage() {
               type="date"
               className={input}
               value={filtros.hasta}
-              onChange={(e) => setFiltros({ ...filtros, hasta: e.target.value })}
+              onChange={(e) => aplicarCambio({ hasta: e.target.value })}
             />
           </div>
-          <div className="flex gap-2 col-span-2 md:col-span-1 lg:col-span-1">
-            <button
-              type="submit"
-              className="flex-1 bg-ink text-concrete text-sm font-mono-tag uppercase tracking-wide py-1.5 hover:bg-amber hover:text-ink transition-colors"
-            >
-              Filtrar
-            </button>
+          <div className="col-span-2 md:col-span-1 lg:col-span-1">
             <button
               type="button"
               onClick={limpiarFiltros}
-              className="border border-line text-sm font-mono-tag uppercase tracking-wide px-3 py-1.5 hover:border-ink transition-colors"
+              className="w-full border border-line text-sm font-mono-tag uppercase tracking-wide px-3 py-1.5 hover:border-ink transition-colors"
             >
               Limpiar
             </button>
           </div>
-        </form>
+        </div>
 
         <div className="bg-white border-2 border-ink overflow-x-auto">
           <table className="w-full text-sm">

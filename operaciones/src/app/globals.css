@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+:root {
+  /* Paleta institucional UPC: rojo, negro/gris, blanco. */
+  --concrete: #ffffff;
+  --page: #eff2f7;
+  --concrete-dim: #e6eaf1;
+  --ink: #131722;
+  --ink-soft: #566074;
+  --line: #dde2ea;
+  --line-strong: #bfc7d4;
+  /* Azul pizarra: segundo color de apoyo (encabezados de tabla, énfasis secundario). */
+  --slate: #1f3a5f;
+  --slate-soft: #e4ebf5;
+
+  /* El nombre de la variable ("amber") quedó del diseño anterior, pero
+     ahora lleva el rojo institucional de UPC — se deja así para no
+     tener que renombrar cada clase de Tailwind (bg-amber, text-amber…)
+     en todos los componentes. Todos los rojos de la app (acento, texto
+     destacado, errores) usan este mismo tono, sin variantes. */
+  --amber: #d0112d;
+  --amber-ink: #d0112d;
+  --amber-hover: #b00e27;
+
+  --teal: #1f8a64;
+  --teal-soft: #dff3ea;
+  --danger: #d0112d;
+  --danger-soft: #fbe6e9;
+}
+
+@theme inline {
+  --color-concrete: var(--concrete);
+  --color-page: var(--page);
+  --color-concrete-dim: var(--concrete-dim);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --shadow-card: 0 1px 2px rgba(19, 23, 34, 0.06), 0 6px 18px -8px rgba(19, 23, 34, 0.14);
+  --color-slate-ink: var(--slate);
+  --color-slate-soft: var(--slate-soft);
+  --color-amber: var(--amber);
+  --color-amber-ink: var(--amber-ink);
+  --color-amber-hover: var(--amber-hover);
+  --color-teal: var(--teal);
+  --color-teal-soft: var(--teal-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --font-display: var(--font-barlow-condensed);
+  --font-mono: var(--font-plex-mono);
+  --font-sans: var(--font-inter);
+}
+
+body {
+  background: linear-gradient(180deg, #e3e9f3 0, var(--page) 320px) no-repeat, var(--page);
+  color: var(--ink);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-display), sans-serif;
+}
+
+.font-mono-tag {
+  font-family: var(--font-mono), monospace;
+}
+
+:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--amber);
+  color: #ffffff;
+}
+
+/* Vista de impresión: oculta en pantalla, visible solo al imprimir */
+.solo-impresion {
+  display: none;
+}
+
+@media print {
+  body {
+    background: #ffffff;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .solo-impresion {
+    display: block !important;
+  }
+}

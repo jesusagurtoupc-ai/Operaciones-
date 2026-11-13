@@ -1,0 +1,733 @@
+"use client";
+
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useRouter } from "next/navigation";
+import TopNav from "@/components/layout/TopNav";
+import { useMe } from "@/lib/client";
+import GuardarCarpeta from "@/components/ticket/GuardarCarpeta";
+import EstadoBadge from "@/components/ticket/EstadoBadge";
+import {
+  ESTADOS,
+  DOCUMENTOS,
+} from "@/lib/shared";
+import type { Correctivo } from "@/lib/shared";
+import { formatoSoles, formatoFecha } from "@/lib/shared";
+import { AvanceDocs, TarjetaEstado, GrupoChips } from "@/components/lista/Piezas";
+import PanelNotificaciones from "@/components/lista/PanelNotificaciones";
+import SelectorProveedor from "@/components/lista/SelectorProveedor";
+import dynamic from "next/dynamic";
+
+// Las cargas masivas (OC/cotizaciones/informes y "+ Documentos") son solo para administradores y son el
+// código más pesado de la lista (lectores, emparejamiento): se descargan aparte, solo cuando se muestran,
+// así la lista abre más rápido para todos (y los de solo lectura nunca bajan ese código).
+const BotonCargando = ({ texto }: { texto: string }) => (
+  <span className="border border-amber text-amber-800 rounded-md px-4 py-2 text-sm font-medium opacity-60">{texto}</span>
+);
+const CargaOC = dynamic(() => import("@/components/lista/CargaOC"), {
+  ssr: false,
+  loading: () => <BotonCargando texto="+ OC / Cotización / Informe" />,
+});
+const CargaDocumentos = dynamic(() => import("@/components/lista/CargaDocumentos"), {
+  ssr: false,
+  loading: () => <BotonCargando texto="+ Documentos" />,
+});
+import {
+  DIMENSIONES,
+  FILTROS_VACIOS,
+  FACETAS_VACIAS,
+  TITULO_GRUPO,
+  ACENTO_ESTADO,
+  construirParams,
+  unirOrdenado,
+  urlLista,
+  recordarLista,
+  type Dimension,
+  type Filtros,
+  type ItemFaceta,
+  type Facetas,
+} from "@/components/lista/filtrosLista";
+
+/** Primera página ya consultada por el servidor (misma forma que GET /api/correctivos). */
+export type ListaInicial = {
+  data: Correctivo[];
+  pagination?: { page: number; pageSize: number; total: number; totalPages: number };
+  resumen?: { total: number; monto: number };
+  facetas?: Partial<Facetas>;
+};
+
+export default function ListaCorrectivos({
+  inicial = null,
+  filtrosIniciales = FILTROS_VACIOS,
+  paginaInicial = 1,
+}: {
+  inicial?: ListaInicial | null;
+  /** Filtros y página que venían en la dirección (al volver de un ticket, por ejemplo). */
+  filtrosIniciales?: Filtros;
+  paginaInicial?: number;
+}) {
+  const router = useRouter();
+  const me = useMe();
+  const esAdmin = me?.rol === "admin";
+  const [rows, setRows] = useState<Correctivo[]>(inicial?.data ?? []);
+  const [eliminandoId, setEliminandoId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(!inicial);
+  const [error, setError] = useState("");
+  const [page, setPage] = useState(paginaInicial);
+  const [totalPages, setTotalPages] = useState(inicial?.pagination?.totalPages || 1);
+  const [total, setTotal] = useState(inicial?.pagination?.total || 0);
+  const [resumen, setResumen] = useState(
+    inicial?.resumen ?? { total: inicial?.pagination?.total || 0, monto: 0 }
+  );
+  const [facetas, setFacetas] = useState<Facetas>({ ...FACETAS_VACIAS, ...(inicial?.facetas ?? {}) });
+  // Todas las opciones que existen en los datos. Se acumulan para que las
+  // tarjetas no aparezcan y desaparezcan al filtrar (solo se atenúan).
+  const [catalogo, setCatalogo] = useState<Record<Dimension, string[]>>(() => {
+    const base: Record<Dimension, string[]> = {
+      estado: [...ESTADOS],
+      tipo_trab: [],
+      sub_tipo_trab: [],
+      lugar: [],
+      area: [],
+      proveedor: [],
+      sin: DOCUMENTOS.map((d) => d.nombre),
+    };
+    // Con la primera página ya traída, el catálogo se arma igual que lo haría `cargar`.
+    const inicialFacetas: Facetas = { ...FACETAS_VACIAS, ...(inicial?.facetas ?? {}) };
+    for (const dim of DIMENSIONES) {
+      base[dim] = unirOrdenado(dim, base[dim], inicialFacetas[dim].map((i) => i.valor));
+    }
+    return base;
+  });
+
+  const [filtros, setFiltros] = useState<Filtros>(filtrosIniciales);
+  // Siempre apunta a los filtros más recientes (para el retardo de la búsqueda).
+  const filtrosActuales = useRef<Filtros>(filtrosIniciales);
+  useEffect(() => {
+    filtrosActuales.current = filtros;
+  }, [filtros]);
+
+  // Si se hacen varios clics seguidos, las respuestas pueden llegar en
+  // desorden; solo la solicitud más reciente actualiza la pantalla.
+  const solicitud = useRef(0);
+  // Y la anterior se cancela: no sigue ocupando la conexión ni el ancho de banda.
+  const enCurso = useRef<AbortController | null>(null);
+  // Sube cuando los DATOS cambian (eliminar, restaurar, cargas masivas): solo entonces se vuelven a pedir
+  // las notificaciones. Antes se pedían con cada cambio de filtro, aunque no dependen de los filtros.
+  const [versionDatos, setVersionDatos] = useState(0);
+  const datosCambiaron = () => setVersionDatos((v) => v + 1);
+
+  // `cargar` recibe los filtros explícitamente (en vez de leerlos del
+  // estado del componente) para no depender de un closure que podría
+  // quedar desactualizado justo después de un setFiltros().
+  const cargar = useCallback(async (p: number, f: Filtros, soloPagina = false) => {
+    const id = ++solicitud.current;
+    enCurso.current?.abort();
+    const ctl = new AbortController();
+    enCurso.current = ctl;
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`/api/correctivos?${construirParams(f, p, soloPagina).toString()}`, { signal: ctl.signal });
+      const data = await res.json();
+      if (id !== solicitud.current) return;
+      if (!res.ok) throw new Error(data?.error || "Error");
+
+      setRows(data.data ?? []);
+      setTotalPages(data.pagination?.totalPages || 1);
+      setTotal(data.pagination?.total || 0);
+      setPage(p);
+      // La vista queda en la dirección (sin recargar la página) y se recuerda para volver desde un ticket.
+      const url = urlLista(f, p);
+      if (window.location.pathname === "/correctivos" && window.location.pathname + window.location.search !== url) {
+        window.history.replaceState(null, "", url);
+      }
+      recordarLista(url);
+      if (soloPagina) return; // cambio de página: tarjetas y resumen siguen igual
+      setResumen(data.resumen ?? { total: data.pagination?.total || 0, monto: 0 });
+
+      const nuevas: Facetas = { ...FACETAS_VACIAS, ...(data.facetas ?? {}) };
+      setFacetas(nuevas);
+      setCatalogo((prev) => {
+        const sig = { ...prev };
+        for (const dim of DIMENSIONES) {
+          sig[dim] = unirOrdenado(dim, prev[dim], nuevas[dim].map((i) => i.valor));
+        }
+        return sig;
+      });
+    } catch {
+      if (id === solicitud.current) {
+        setError("No se pudieron cargar los tickets. Revisa tu conexión e intenta de nuevo.");
+      }
+    } finally {
+      if (id === solicitud.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Si el servidor ya entregó la primera página no hace falta pedirla otra vez.
+    if (!inicial) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      cargar(paginaInicial, filtrosIniciales);
+    } else {
+      recordarLista(urlLista(filtrosIniciales, paginaInicial));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Cualquier cambio de filtro se aplica al instante, sin botón "Filtrar".
+  function aplicarCambio(cambios: Partial<Filtros>) {
+    const nuevos = { ...filtros, ...cambios };
+    setFiltros(nuevos);
+    cargar(1, nuevos);
+  }
+
+  // Tarjeta/opción: si estaba elegida se quita, si no se agrega (selección
+  // múltiple dentro de cada categoría).
+  function alternar(dim: Dimension, valor: string) {
+    const actuales = filtros[dim];
+    const nuevos = actuales.includes(valor)
+      ? actuales.filter((v) => v !== valor)
+      : [...actuales, valor];
+    aplicarCambio({ [dim]: nuevos } as Partial<Filtros>);
+  }
+
+  // El texto de búsqueda se ve al instante, pero la consulta se manda un
+  // instante después de que la persona deja de escribir.
+  const primerRender = useRef(true);
+  useEffect(() => {
+    if (primerRender.current) {
+      primerRender.current = false;
+      return;
+    }
+    const t = setTimeout(() => {
+      cargar(1, filtrosActuales.current);
+    }, 350);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtros.q]);
+
+  function limpiarFiltros() {
+    // El orden y la papelera no son filtros: se conservan al limpiar.
+    const limpios = { ...FILTROS_VACIOS, orden: filtros.orden, papelera: filtros.papelera };
+    setFiltros(limpios);
+    cargar(1, limpios);
+  }
+
+  // Clic en el título "Ref": alterna entre mayor→menor y menor→mayor.
+  const ordenRef = filtros.orden === "ref_asc" ? "ref_asc" : "ref_desc";
+  function alternarOrdenRef() {
+    aplicarCambio({ orden: ordenRef === "ref_desc" ? "ref_asc" : "ref_desc" });
+  }
+
+  /* ───── Vistas guardadas (solo en este navegador, vía localStorage) ───── */
+  const [vistas, setVistas] = useState<{ nombre: string; filtros: Filtros }[]>([]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("correctivos_vistas");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (raw) setVistas(JSON.parse(raw));
+    } catch {
+      // localStorage no disponible (modo incógnito, etc.): se ignora.
+    }
+  }, []);
+
+  function persistirVistas(nuevas: { nombre: string; filtros: Filtros }[]) {
+    setVistas(nuevas);
+    try {
+      localStorage.setItem("correctivos_vistas", JSON.stringify(nuevas));
+    } catch {
+      // si falla el guardado no rompemos la app, solo no persiste.
+    }
+  }
+
+  function guardarVistaActual() {
+    const nombre = window.prompt(
+      "Nombre para esta combinación de filtros (ej. \"Pendientes pabellón A\")"
+    );
+    if (!nombre || !nombre.trim()) return;
+    const limpio = nombre.trim();
+    const sinDuplicado = vistas.filter((v) => v.nombre !== limpio);
+    persistirVistas([...sinDuplicado, { nombre: limpio, filtros }]);
+  }
+
+  function aplicarVista(v: { nombre: string; filtros: Filtros }) {
+    // Las vistas guardadas antes de existir un filtro no lo traen: se completan con los vacíos.
+    const f = { ...FILTROS_VACIOS, ...v.filtros };
+    setFiltros(f);
+    cargar(1, f);
+  }
+
+  function eliminarVista(nombre: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    persistirVistas(vistas.filter((v) => v.nombre !== nombre));
+  }
+
+  async function eliminar(r: Pick<Correctivo, "id" | "refer" | "descripcion">) {
+    if (eliminandoId !== null) return;
+    const resumen = (r.descripcion ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+    if (
+      !confirm(
+        `¿Eliminar el ticket #${r.refer ?? r.id}${resumen ? ` («${resumen}»)` : ""}?\n\n` +
+          "Se envía a la papelera: sus archivos e historial se conservan y podrás restaurarlo."
+      )
+    )
+      return;
+    setEliminandoId(r.id);
+    try {
+      const res = await fetch(`/api/correctivos/${r.id}`, { method: "DELETE" });
+      if (res.ok) {
+        cargar(page, filtros);
+        datosCambiaron();
+      } else {
+        const d = await res.json().catch(() => null);
+        alert(d?.error || "No se pudo eliminar el registro");
+      }
+    } catch {
+      alert("No se pudo eliminar el registro. Revisa tu conexión e inténtalo de nuevo");
+    } finally {
+      setEliminandoId(null);
+    }
+  }
+
+  async function restaurar(id: number) {
+    const res = await fetch(`/api/correctivos/${id}/restaurar`, { method: "POST" });
+    if (res.ok) {
+      cargar(page, filtros);
+      datosCambiaron();
+    } else {
+      const d = await res.json().catch(() => null);
+      alert(d?.error || "No se pudo restaurar el registro");
+    }
+  }
+
+  async function eliminarDefinitivo(id: number) {
+    if (
+      !confirm(
+        "¿Eliminar DEFINITIVAMENTE este correctivo? Se borrarán también sus archivos e historial y no se podrá recuperar."
+      )
+    )
+      return;
+    const res = await fetch(`/api/correctivos/${id}?definitivo=1`, { method: "DELETE" });
+    if (res.ok) {
+      cargar(page, filtros);
+    } else {
+      const d = await res.json().catch(() => null);
+      alert(d?.error || "No se pudo eliminar el registro");
+    }
+  }
+
+  // Cambia entre la lista normal y la papelera (empieza sin filtros; el orden se conserva).
+  function alternarPapelera() {
+    const nuevos = { ...FILTROS_VACIOS, orden: filtros.orden, papelera: filtros.papelera ? "" : "1" };
+    setFiltros(nuevos);
+    cargar(1, nuevos);
+  }
+
+  /** Trae todos los tickets que cumplen los filtros actuales (de 200 en 200). */
+  async function cargarTodosFiltrados() {
+    const todos: Correctivo[] = [];
+    for (let p = 1; ; p++) {
+      const params = construirParams(filtros, p);
+      params.set("pageSize", "200");
+      const res = await fetch(`/api/correctivos?${params.toString()}`);
+      if (!res.ok) throw new Error("No se pudo leer la lista de tickets");
+      const d = await res.json();
+      todos.push(...d.data);
+      if (p >= d.pagination.totalPages) break;
+    }
+    return todos;
+  }
+
+  function exportar() {
+    window.open(`/api/export?${construirParams(filtros).toString()}`, "_blank");
+  }
+
+  const enPapelera = filtros.papelera === "1";
+
+  const activos =
+    (filtros.q ? 1 : 0) +
+    (filtros.desde ? 1 : 0) +
+    (filtros.hasta ? 1 : 0) +
+    DIMENSIONES.reduce((n, d) => n + filtros[d].length, 0);
+
+  // Une el catálogo (opciones que existen) con los conteos actuales.
+  function itemsDe(dim: Dimension): ItemFaceta[] {
+    const porValor = new Map(facetas[dim].map((i) => [i.valor, i]));
+    return catalogo[dim].map((v) => porValor.get(v) ?? { valor: v, cantidad: 0, monto: 0 });
+  }
+
+  const input =
+    "w-full border border-line rounded-md px-2.5 py-1.5 bg-white text-sm focus:outline-none focus:border-slate-400 focus:ring-4 focus:ring-slate-200/70";
+  const label = "block text-xs font-medium text-ink-soft mb-1";
+
+  return (
+    <div className="min-h-screen bg-page">
+      <TopNav />
+      <main className="max-w-7xl mx-auto px-5 py-8">
+        <div className="flex flex-wrap items-baseline justify-between gap-3 mb-6">
+          <h1 className="font-display font-bold text-4xl tracking-tight">{enPapelera ? "Papelera" : "Correctivos"}</h1>
+          <div className="flex gap-2 flex-wrap items-start">
+            {esAdmin && (
+              <button
+                onClick={alternarPapelera}
+                className="border border-line-strong rounded-md px-4 py-2 text-sm font-medium hover:bg-concrete-dim transition-colors"
+              >
+                {enPapelera ? "← Volver a los tickets" : "Papelera"}
+              </button>
+            )}
+            {!enPapelera && (
+              <>
+              <GuardarCarpeta
+                cargarTodos={cargarTodosFiltrados}
+                etiqueta="Guardar vista en carpeta"
+              />
+              <button
+                onClick={exportar}
+                className="border border-line-strong rounded-md px-4 py-2 text-sm font-medium hover:bg-concrete-dim transition-colors"
+              >
+                Exportar Excel
+              </button>
+              {esAdmin && <CargaOC onTerminado={() => { cargar(1, filtrosActuales.current); datosCambiaron(); }} />}
+              {esAdmin && <CargaDocumentos onTerminado={() => { cargar(1, filtrosActuales.current); datosCambiaron(); }} />}
+
+              </>
+            )}
+          </div>
+        </div>
+
+        {enPapelera && (
+          <div className="mb-6 rounded-md border border-line bg-concrete-dim px-4 py-3 text-sm text-ink-soft">
+            Aquí están los correctivos eliminados. Se conservan con sus archivos e historial: puedes
+            <strong> restaurarlos</strong> o eliminarlos <strong>definitivamente</strong>. Los que lleven
+            más de 30 días aquí se eliminan definitivamente de forma automática.
+          </div>
+        )}
+
+        {/* ───── Panel de filtros con KPI ───── */}
+        <section className="bg-white border border-line rounded-lg shadow-card mb-6">
+          {/* Resumen de lo que se está viendo */}
+          <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3 border-b border-line bg-concrete-dim">
+            <div className="flex items-end gap-8">
+              <div>
+                <span className={label + " !mb-0"}>Tickets</span>
+                <span className="font-display font-bold text-3xl leading-none">
+                  {resumen.total}
+                </span>
+              </div>
+              <div>
+                <span className={label + " !mb-0"}>Monto</span>
+                <span className="font-display font-bold text-3xl leading-none text-ink">
+                  {formatoSoles(resumen.monto, 0)}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="hidden md:inline text-xs text-ink-soft">
+                Toca una o varias tarjetas para filtrar
+              </span>
+              {activos > 0 && !enPapelera && (
+                <button
+                  type="button"
+                  onClick={guardarVistaActual}
+                  className="border border-line-strong rounded-md bg-white px-3 py-1.5 text-xs font-medium hover:bg-concrete-dim transition-colors"
+                >
+                  Guardar vista
+                </button>
+              )}
+              {activos > 0 && (
+                <button
+                  type="button"
+                  onClick={limpiarFiltros}
+                  className="border border-line-strong rounded-md bg-white px-3 py-1.5 text-xs font-medium hover:bg-concrete-dim transition-colors"
+                >
+                  Limpiar filtros ({activos})
+                </button>
+              )}
+            </div>
+          </div>
+
+          {vistas.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-line bg-white">
+              <span className="text-xs font-medium text-ink-soft mr-1">
+                Vistas guardadas:
+              </span>
+              {vistas.map((v) => (
+                <button
+                  key={v.nombre}
+                  type="button"
+                  onClick={() => aplicarVista(v)}
+                  className="group flex items-center gap-1.5 border border-line rounded-md px-2.5 py-1 text-xs hover:border-line-strong hover:bg-concrete-dim transition-colors"
+                >
+                  {v.nombre}
+                  <span
+                    role="button"
+                    tabIndex={-1}
+                    onClick={(e) => eliminarVista(v.nombre, e)}
+                    className="text-ink-soft hover:text-ink"
+                    title="Eliminar esta vista"
+                  >
+                    ×
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="p-4 space-y-5">
+            {/* Fechas y proveedor */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <div className="col-span-2">
+                <label className={label}>Proveedor</label>
+                <SelectorProveedor
+                  items={itemsDe("proveedor")}
+                  seleccionados={filtros.proveedor}
+                  onAlternar={(v) => alternar("proveedor", v)}
+                  onLimpiar={() => aplicarCambio({ proveedor: [] })}
+                />
+              </div>
+              <div>
+                <label className={label}>Desde</label>
+                <input
+                  type="date"
+                  className={input}
+                  value={filtros.desde}
+                  onChange={(e) => aplicarCambio({ desde: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className={label}>Hasta</label>
+                <input
+                  type="date"
+                  className={input}
+                  value={filtros.hasta}
+                  onChange={(e) => aplicarCambio({ hasta: e.target.value })}
+                />
+              </div>
+            </div>
+
+            {/* Estado: tarjetas KPI */}
+            <div>
+              <p className={label + " !mb-2"}>
+                Estado
+                {filtros.estado.length > 0 && (
+                  <span className="ml-2 text-ink-soft">
+                    · {filtros.estado.length} elegido{filtros.estado.length === 1 ? "" : "s"}
+                  </span>
+                )}
+              </p>
+              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+                {itemsDe("estado").map((it) => (
+                  <TarjetaEstado
+                    key={it.valor}
+                    etiqueta={it.valor}
+                    cantidad={it.cantidad}
+                    monto={it.monto}
+                    acento={ACENTO_ESTADO[it.valor] ?? "#8c8c90"}
+                    activa={filtros.estado.includes(it.valor)}
+                    onClick={() => alternar("estado", it.valor)}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Resto de categorías: opciones con contador */}
+            <div className="grid md:grid-cols-2 gap-x-8 gap-y-5 pt-4 border-t border-line">
+              {(["tipo_trab", "sub_tipo_trab", "lugar", "area", "sin"] as const).map((dim) => (
+                <GrupoChips
+                  key={dim}
+                  titulo={TITULO_GRUPO[dim]}
+                  items={itemsDe(dim)}
+                  seleccionados={filtros[dim]}
+                  onAlternar={(v) => alternar(dim, v)}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {error && (
+          <p className="mb-4 text-sm text-danger bg-danger-soft border border-danger/30 px-3 py-2">
+            {error}
+          </p>
+        )}
+
+        {!enPapelera && <PanelNotificaciones refrescar={versionDatos} />}
+
+        {/* ───── Tabla ───── */}
+        <div
+          className={`bg-white border border-line rounded-lg shadow-card overflow-x-auto transition-opacity ${
+            loading && rows.length > 0 ? "opacity-50" : ""
+          }`}
+        >
+          {/* Diseño fijo: las columnas se reparten el ancho disponible y la descripción cede espacio
+              (se corta con "…"), así Estado y Docs caben en pantallas normales sin desplazarse. */}
+          <table className="w-full table-fixed text-sm">
+            <colgroup>
+              <col className="w-[56px]" />
+              <col className="w-[140px]" />
+              <col />
+              <col className="w-[120px]" />
+              <col className="w-[112px]" />
+              <col className="w-[160px]" />
+              <col className="w-[88px]" />
+              <col className="w-[64px] xl:w-[112px]" />
+            </colgroup>
+            <thead>
+              <tr className="border-b border-line bg-slate-soft">
+                <th className="text-left px-3 py-3 text-xs font-semibold text-slate-ink" aria-sort={ordenRef === "ref_asc" ? "ascending" : "descending"}>
+                  <button type="button" onClick={alternarOrdenRef} className="inline-flex items-center gap-1 font-medium hover:text-ink" title="Cambiar el orden de la Ref">
+                    Ref <span aria-hidden="true">{ordenRef === "ref_asc" ? "▲" : "▼"}</span>
+                  </button>
+                </th>
+                <th className="text-left px-3 py-3 text-xs font-semibold text-slate-ink">N° OC</th>
+                <th className="text-left px-3 py-3 text-xs font-semibold text-slate-ink">Descripción</th>
+                <th className="text-left px-3 py-3 text-xs font-semibold text-slate-ink">Proveedor</th>
+                <th className="text-right px-3 py-3 text-xs font-semibold text-slate-ink">Monto</th>
+                <th className="text-left px-3 py-3 text-xs font-semibold text-slate-ink">Estado</th>
+                <th className="text-left px-3 py-3 text-xs font-semibold text-slate-ink">Docs</th>
+                <th className="text-right px-3 py-3 text-xs font-medium text-ink-soft sticky right-0 bg-slate-soft">Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && rows.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="text-center py-10 text-ink-soft text-sm">
+                    Cargando…
+                  </td>
+                </tr>
+              ) : rows.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="text-center py-10 text-ink-soft text-sm">
+                    {enPapelera ? "La papelera está vacía." : "No hay tickets con esta combinación de filtros."}
+                  </td>
+                </tr>
+              ) : (
+                rows.map((r) => (
+                  <tr
+                    key={r.id}
+                    tabIndex={0}
+                    onClick={() => {
+                      // Un correctivo en la papelera no se abre; se restaura o se elimina.
+                      if (enPapelera) return;
+                      // No abrir si la persona estaba seleccionando texto.
+                      if (window.getSelection()?.toString()) return;
+                      router.push(`/correctivos/${r.id}`);
+                    }}
+                    // Al pasar el mouse se adelanta la carga del ticket: el clic abre casi al instante.
+                    onMouseEnter={() => {
+                      if (!enPapelera) router.prefetch(`/correctivos/${r.id}`);
+                    }}
+                    onKeyDown={(e) => {
+                      if (!enPapelera && e.target === e.currentTarget && e.key === "Enter") {
+                        router.push(`/correctivos/${r.id}`);
+                      }
+                    }}
+                    className={`group border-b border-line last:border-b-0 hover:bg-amber/[0.04] focus:outline-none focus:bg-amber/[0.06] ${enPapelera ? "" : "cursor-pointer"}`}
+                  >
+                    <td className="px-3 py-3.5 font-mono-tag text-xs">{r.refer ?? r.id}</td>
+                    <td className="px-3 py-3.5 font-mono-tag text-xs">
+                      <div className="truncate" title={r.n_oc ?? undefined}>{r.n_oc || "—"}</div>
+                    </td>
+                    <td className="px-3 py-3.5" title={r.descripcion}>
+                      <div className="truncate">{r.descripcion}</div>
+                      {enPapelera && (
+                        <div className="text-xs text-ink-soft mt-0.5">
+                          Eliminado por {r.eliminado_por || "—"} · {formatoFecha(r.eliminado_en ?? null)}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-3 py-3.5">
+                      <div className="truncate" title={r.proveedor ?? undefined}>{r.proveedor || "—"}</div>
+                    </td>
+                    <td className="px-3 py-3.5 text-right font-mono-tag tabular-nums whitespace-nowrap">
+                      {formatoSoles(r.monto)}
+                    </td>
+                    <td className="px-3 py-3.5">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <EstadoBadge estado={r.estado} />
+                      </div>
+                    </td>
+                    <td className="px-3 py-3.5 whitespace-nowrap">
+                      <AvanceDocs documentos={r.documentos} />
+                    </td>
+                    <td className="px-3 py-2.5 text-right whitespace-nowrap sticky right-0 bg-white group-hover:bg-page group-focus:bg-page">
+                      {enPapelera ? (
+                        <div className="flex flex-col items-end gap-1 whitespace-normal">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              restaurar(r.id);
+                            }}
+                            className="text-xs font-medium text-teal hover:underline"
+                          >
+                            Restaurar
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              eliminarDefinitivo(r.id);
+                            }}
+                            className="text-xs font-medium text-danger hover:underline"
+                          >
+                            Eliminar definitivamente
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          {esAdmin && (
+                            <button
+                              type="button"
+                              disabled={eliminandoId !== null}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void eliminar(r);
+                              }}
+                              title="Enviar este ticket a la papelera (se puede restaurar)"
+                              aria-label={`Eliminar el ticket ${r.refer ?? r.id}`}
+                              className="inline-flex items-center gap-1.5 rounded-md border border-danger/40 px-2 xl:px-2.5 py-1 text-xs font-medium text-danger hover:bg-danger-soft hover:border-danger transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                <path d="M3 6h18" />
+                                <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                                <path d="M10 11v6M14 11v6" />
+                              </svg>
+                              <span className="hidden xl:inline">{eliminandoId === r.id ? "Eliminando…" : "Eliminar"}</span>
+                            </button>
+                          )}
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex items-center justify-between mt-4">
+          <span className="text-xs text-ink-soft">
+            {total} registro{total === 1 ? "" : "s"} · página {page} de {totalPages}
+          </span>
+          <div className="flex gap-2">
+            <button
+              disabled={page <= 1}
+              onClick={() => cargar(page - 1, filtros, true)}
+              className="border border-line-strong rounded-md px-3 py-1 text-xs font-medium disabled:opacity-30 hover:bg-concrete-dim"
+            >
+              ← Anterior
+            </button>
+            <button
+              disabled={page >= totalPages}
+              onClick={() => cargar(page + 1, filtros, true)}
+              className="border border-line-strong rounded-md px-3 py-1 text-xs font-medium disabled:opacity-30 hover:bg-concrete-dim"
+            >
+              Siguiente →
+            </button>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}

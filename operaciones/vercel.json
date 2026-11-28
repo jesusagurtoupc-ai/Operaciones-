@@ -1,6 +1,0 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "crons": [
-    { "path": "/api/correctivos/avisos?resumen=semanal", "schedule": "0 13 * * 1" }
-  ]
-}
